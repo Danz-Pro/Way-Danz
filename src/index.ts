@@ -25,15 +25,17 @@ import { QuizQuestion, QuizInfo, CheatConfig } from "./types";
 // ═══════════════════════════════════════════════════════
 
 const CONFIG: CheatConfig = {
-  pollInterval: 400,           // Faster polling for smoother experience
-  highlightColor: "#00E676",   // Bright green for correct answers
-  dimOpacity: "15%",           // Dim wrong answers more aggressively
-  autoAnswer: false,           // Auto-click correct answer (toggle via panel)
-  showPanel: true,             // Show floating control panel
-  debugMode: false,            // Verbose console logging
-  retryAttempts: 3,            // Retry API fetch on failure
-  retryDelay: 1500,            // Delay between retries (ms)
-  mutationDebounce: 200,       // MutationObserver debounce time (ms)
+  pollInterval: 400,
+  highlightColor: "#00E676",
+  dimOpacity: "15%",
+  autoAnswer: false,
+  showPanel: true,
+  debugMode: false,
+  retryAttempts: 3,
+  retryDelay: 1500,
+  mutationDebounce: 250,
+  firstQuestionRetryDelay: 600,
+  firstQuestionMaxRetries: 8,
 };
 
 // ═══════════════════════════════════════════════════════
@@ -43,9 +45,11 @@ const CONFIG: CheatConfig = {
 let cachedQuiz: QuizInfo | null = null;
 let lastQuestionID: string | undefined = undefined;
 let isRunning = false;
+let isProcessing = false;          // Lock to prevent concurrent highlight calls
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let observer: MutationObserver | null = null;
 let panelElement: HTMLElement | null = null;
+let lastHighlightedElements: HTMLElement[] = [];  // Track exactly which elements we styled
 
 // ═══════════════════════════════════════════════════════
 //  PINIA STORE ACCESS (Vue 3)
@@ -78,7 +82,6 @@ const getRoomHash = (): string => {
 const getCurrentQuestionId = (): string | null => {
   try {
     const state = getStoreState("gameQuestions");
-    // Check all possible ID fields (handles different game modes)
     const currentId =
       state.currentId ||
       state.currentQuestionId ||
@@ -147,7 +150,6 @@ const getOptionElements = (): HTMLElement[] => {
   // Strategy 1 (Best): [role="option"] elements
   const roleOptions = Array.from(document.querySelectorAll<HTMLElement>("[role='option']"));
   if (roleOptions.length >= 2) {
-    // Filter for question-specific options with known CSS indicators
     const filtered = roleOptions.filter((el) => {
       const cl = el.className || "";
       const clStr = typeof cl === "object" ? Array.prototype.join.call(cl, " ") : cl;
@@ -193,7 +195,6 @@ const getOptionElements = (): HTMLElement[] => {
     const options = buttons.filter((el) => {
       const text = el.textContent || "";
       const rect = el.getBoundingClientRect();
-      // Must have text content and be reasonably sized (not header/icon buttons)
       return text.trim().length > 1 && text.trim().length < 500 && rect.width > 50 && rect.height > 20;
     });
     if (options.length >= 2) return options;
@@ -221,14 +222,27 @@ const normalizeText = (text: string): string => {
 };
 
 // ═══════════════════════════════════════════════════════
-//  ANSWER HIGHLIGHTING (Enhanced)
+//  ANSWER HIGHLIGHTING (Fixed — no double highlights)
 // ═══════════════════════════════════════════════════════
 
 const clearPreviousHighlights = () => {
-  // Remove any previous highlights from all option elements
-  document.querySelectorAll<HTMLElement>(
-    "[role='option'], [data-testid='options-grid'] > *, .option-button, button[class*='option']"
-  ).forEach((el) => {
+  // Method 1: Clear exactly the elements we previously styled
+  lastHighlightedElements.forEach((el) => {
+    if (el && el.parentNode) {
+      el.style.outline = "";
+      el.style.outlineOffset = "";
+      el.style.opacity = "";
+      el.style.transition = "";
+      el.style.boxShadow = "";
+      el.style.transform = "";
+      el.removeAttribute("data-way-danz-correct");
+      el.removeAttribute("data-way-danz-wrong");
+    }
+  });
+  lastHighlightedElements = [];
+
+  // Method 2: Broad sweep using data attributes (catches any stragglers)
+  document.querySelectorAll<HTMLElement>("[data-way-danz-correct], [data-way-danz-wrong]").forEach((el) => {
     el.style.outline = "";
     el.style.outlineOffset = "";
     el.style.opacity = "";
@@ -257,137 +271,307 @@ const highlightCorrectElement = (elem: HTMLElement) => {
 
 const autoClickAnswer = (elem: HTMLElement) => {
   if (!CONFIG.autoAnswer) return;
-  // Small delay to make it look natural
   setTimeout(() => {
     elem.click();
     log("Auto-clicked correct answer");
   }, 300 + Math.random() * 700);
 };
 
-const highlightAnswers = (question: QuizQuestion) => {
-  clearPreviousHighlights();
+/**
+ * Core highlight function.
+ * IMPORTANT: This is the ONLY place that modifies option element styles.
+ * It temporarily pauses the MutationObserver to prevent re-triggering.
+ */
+const highlightAnswers = (question: QuizQuestion): boolean => {
+  // Pause observer while we modify DOM to prevent self-triggering
+  pauseObserver();
 
-  // Handle supported question types
-  const supportedTypes = ["MCQ", "MSQ", "BLANK", "MATCH", "REORDER", "GRAPH"];
-  if (!supportedTypes.includes(question.type) && question.type !== "MCQ" && question.type !== "MSQ") {
-    log(`Question type "${question.type}" is not supported for highlighting. Showing answer in panel.`, "info");
-    showAnswerInPanel(question);
-    return;
-  }
-
-  let optionElements: HTMLElement[];
   try {
-    optionElements = getOptionElements();
-  } catch (e: any) {
-    log(`Could not find options: ${e.message}. Showing answer in panel.`, "warn");
-    showAnswerInPanel(question);
-    return;
-  }
+    clearPreviousHighlights();
 
-  const answer = question.structure.answer;
-
-  // Handle empty options (show answer as text)
-  if (!question.structure.options || question.structure.options.length < 1) {
-    if (question.structure.query) {
+    // Handle supported question types
+    const supportedTypes = ["MCQ", "MSQ", "BLANK", "MATCH", "REORDER", "GRAPH"];
+    if (!supportedTypes.includes(question.type) && question.type !== "MCQ" && question.type !== "MSQ") {
+      log(`Question type "${question.type}" not supported for highlighting. Showing in panel.`, "info");
       showAnswerInPanel(question);
+      return false;
     }
-    return;
-  }
 
-  const correctAnswerIndices: number[] = [];
+    let optionElements: HTMLElement[];
+    try {
+      optionElements = getOptionElements();
+    } catch (e: any) {
+      log(`Could not find options: ${e.message}. Will retry.`, "warn");
+      showAnswerInPanel(question);
+      return false; // Signal that highlighting failed (for retry)
+    }
 
-  if (Array.isArray(answer) && answer.length > 0) {
-    // MSQ: multiple answers
-    answer.forEach((idx) => {
-      if (typeof idx === "number" && idx >= 0) correctAnswerIndices.push(idx);
-    });
-  } else if (typeof answer === "number" && answer >= 0) {
-    // MCQ: single answer
-    correctAnswerIndices.push(answer);
-  }
+    const answer = question.structure.answer;
 
-  // Build correct answer text set for text-based fallback matching
-  const correctAnswerTexts: Record<string, boolean> = {};
-  correctAnswerIndices.forEach((idx) => {
-    const opt = question.structure.options![idx];
-    if (opt) {
-      const txt = normalizeText(stripHtml(opt.text));
-      if (txt.length > 0) {
-        correctAnswerTexts[txt] = true;
+    // Handle empty options
+    if (!question.structure.options || question.structure.options.length < 1) {
+      if (question.structure.query) {
+        showAnswerInPanel(question);
       }
+      return true;
     }
+
+    const correctAnswerIndices: number[] = [];
+
+    if (Array.isArray(answer) && answer.length > 0) {
+      answer.forEach((idx) => {
+        if (typeof idx === "number" && idx >= 0) correctAnswerIndices.push(idx);
+      });
+    } else if (typeof answer === "number" && answer >= 0) {
+      correctAnswerIndices.push(answer);
+    }
+
+    // Build correct answer text set for text-based fallback matching
+    const correctAnswerTexts: Record<string, boolean> = {};
+    correctAnswerIndices.forEach((idx) => {
+      const opt = question.structure.options![idx];
+      if (opt) {
+        const txt = normalizeText(stripHtml(opt.text));
+        if (txt.length > 0) {
+          correctAnswerTexts[txt] = true;
+        }
+      }
+    });
+
+    let correctCount = 0;
+    let firstCorrectElement: HTMLElement | null = null;
+
+    // Track ALL elements we style for precise cleanup later
+    const styledElements: HTMLElement[] = [];
+
+    optionElements.forEach((elem, domIndex) => {
+      let isCorrect = false;
+
+      // Strategy 1: Index-based matching
+      if (correctAnswerIndices.indexOf(domIndex) !== -1) {
+        isCorrect = true;
+      }
+
+      // Strategy 2: Normalized text-based matching
+      if (!isCorrect && Object.keys(correctAnswerTexts).length > 0) {
+        const elemText = normalizeText(stripHtml(elem.textContent || ""));
+        for (const correctText in correctAnswerTexts) {
+          if (
+            elemText.length > 0 &&
+            correctText.length > 0 &&
+            (elemText === correctText ||
+              elemText.indexOf(correctText) !== -1 ||
+              correctText.indexOf(elemText) !== -1)
+          ) {
+            isCorrect = true;
+            break;
+          }
+        }
+      }
+
+      // Strategy 3: Check data attributes for option index
+      if (!isCorrect) {
+        const dataIdx = elem.getAttribute("data-index") || elem.getAttribute("data-option-index");
+        if (dataIdx) {
+          const attrIndex = parseInt(dataIdx, 10);
+          if (!isNaN(attrIndex) && correctAnswerIndices.indexOf(attrIndex) !== -1) {
+            isCorrect = true;
+          }
+        }
+      }
+
+      // Strategy 4: Check class name for option index
+      if (!isCorrect) {
+        const cl = elem.className || "";
+        const clStr = typeof cl === "object" ? Array.prototype.join.call(cl, " ") : cl;
+        const match = clStr.match(/\boption-(\d+)\b/);
+        if (match) {
+          const classIndex = parseInt(match[1], 10) - 1;
+          if (correctAnswerIndices.indexOf(classIndex) !== -1) {
+            isCorrect = true;
+          }
+        }
+      }
+
+      if (isCorrect) {
+        highlightCorrectElement(elem);
+        correctCount++;
+        if (!firstCorrectElement) firstCorrectElement = elem;
+      } else {
+        changeElementOpacity(elem);
+      }
+      styledElements.push(elem);
+    });
+
+    // Save reference to exactly which elements we styled
+    lastHighlightedElements = styledElements;
+
+    // Auto-click the first correct answer for MCQ
+    if (firstCorrectElement && correctAnswerIndices.length === 1) {
+      autoClickAnswer(firstCorrectElement);
+    }
+
+    log(`Highlighted ${correctCount} correct answer(s) out of ${optionElements.length} options`);
+    updatePanelQuestion(question, correctCount);
+    return true; // Highlighting succeeded
+  } finally {
+    // Resume observer after DOM modifications are done
+    resumeObserver();
+  }
+};
+
+// ═══════════════════════════════════════════════════════
+//  MUTATION OBSERVER — Pause/Resume to prevent self-trigger
+// ═══════════════════════════════════════════════════════
+
+let observerIsPaused = false;
+
+const pauseObserver = () => {
+  if (observer && !observerIsPaused) {
+    observer.disconnect();
+    observerIsPaused = true;
+    log("Observer paused", "info");
+  }
+};
+
+const resumeObserver = () => {
+  if (observer && observerIsPaused) {
+    observerIsPaused = false;
+    // Small delay before reconnecting to let our DOM changes settle
+    setTimeout(() => {
+      if (observer && !observerIsPaused) {
+        setupMutationObserver();
+        log("Observer resumed", "info");
+      }
+    }, 100);
+  }
+};
+
+const setupMutationObserver = () => {
+  if (observer) observer.disconnect();
+
+  let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+  observer = new MutationObserver((mutations) => {
+    // Skip if we're the ones modifying the DOM
+    if (observerIsPaused) return;
+
+    // Filter out mutations caused by our own data attributes
+    const relevantMutation = mutations.some((m) => {
+      // Ignore attribute changes on elements we tagged
+      if (m.type === "attributes") {
+        const target = m.target as HTMLElement;
+        if (target.hasAttribute("data-way-danz-correct") || target.hasAttribute("data-way-danz-wrong")) {
+          return false;
+        }
+        // Only react to class/data-testid/role changes (not style changes)
+        const attrName = m.attributeName;
+        if (attrName === "style") return false;
+        return true;
+      }
+      // childList changes are always relevant
+      return m.type === "childList";
+    });
+
+    if (!relevantMutation) return;
+
+    if (debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => {
+      if (!observerIsPaused) {
+        checkQuestionChange();
+      }
+    }, CONFIG.mutationDebounce);
   });
 
-  let correctCount = 0;
-  let firstCorrectElement: HTMLElement | null = null;
+  observer.observe(document.body, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ["class", "data-testid", "role"],  // Do NOT watch "style" or custom data attrs
+  });
 
-  optionElements.forEach((elem, domIndex) => {
-    let isCorrect = false;
+  observerIsPaused = false;
+};
 
-    // Strategy 1: Index-based matching (primary, most reliable)
-    if (correctAnswerIndices.indexOf(domIndex) !== -1) {
-      isCorrect = true;
+// ═══════════════════════════════════════════════════════
+//  CORE LOGIC (Fixed — with processing lock & first-Q retry)
+// ═══════════════════════════════════════════════════════
+
+/**
+ * Try to highlight a question with retry for the first question.
+ * The DOM may not have rendered options yet when the game first loads.
+ */
+const tryHighlightWithRetry = async (question: QuizQuestion, questionId: string) => {
+  let success = false;
+  let attempts = 0;
+
+  while (!success && attempts < CONFIG.firstQuestionMaxRetries) {
+    success = highlightAnswers(question);
+    if (success) break;
+
+    attempts++;
+    log(`Option elements not ready, retry ${attempts}/${CONFIG.firstQuestionMaxRetries} in ${CONFIG.firstQuestionRetryDelay}ms`, "warn");
+    await new Promise((r) => setTimeout(r, CONFIG.firstQuestionRetryDelay));
+  }
+
+  if (!success) {
+    log(`Failed to highlight after ${CONFIG.firstQuestionMaxRetries} retries. Answer shown in panel.`, "warn");
+  }
+
+  // Always update lastQuestionID regardless of success
+  lastQuestionID = questionId;
+};
+
+const checkQuestionChange = () => {
+  if (!cachedQuiz) return;
+
+  // Processing lock: prevent concurrent execution
+  if (isProcessing) return;
+
+  try {
+    const currentId = getCurrentQuestionId();
+    if (!currentId || currentId === lastQuestionID) return;
+
+    // Find the question in cached quiz data
+    let foundQuestion: QuizQuestion | null = null;
+
+    for (const q of cachedQuiz.data.questions) {
+      if (currentId === q._id) {
+        foundQuestion = q;
+        break;
+      }
     }
 
-    // Strategy 2: Normalized text-based matching (fallback for shuffled/dynamic options)
-    if (!isCorrect && Object.keys(correctAnswerTexts).length > 0) {
-      const elemText = normalizeText(stripHtml(elem.textContent || ""));
-      for (const correctText in correctAnswerTexts) {
-        if (
-          elemText.length > 0 &&
-          correctText.length > 0 &&
-          (elemText === correctText ||
-            elemText.indexOf(correctText) !== -1 ||
-            correctText.indexOf(elemText) !== -1)
-        ) {
-          isCorrect = true;
+    // Fallback: check Pinia store question list
+    if (!foundQuestion) {
+      const storeQuestions = getQuestionList();
+      for (const q of storeQuestions) {
+        if (currentId === q._id) {
+          foundQuestion = q;
           break;
         }
       }
     }
 
-    // Strategy 3: Check data attributes for option index
-    if (!isCorrect) {
-      const dataIdx = elem.getAttribute("data-index") || elem.getAttribute("data-option-index");
-      if (dataIdx) {
-        const attrIndex = parseInt(dataIdx, 10);
-        if (!isNaN(attrIndex) && correctAnswerIndices.indexOf(attrIndex) !== -1) {
-          isCorrect = true;
-        }
-      }
-    }
+    if (!foundQuestion) return;
 
-    // Strategy 4: Check class name for option index (e.g., "option-3" means index 2)
-    if (!isCorrect) {
-      const cl = elem.className || "";
-      const clStr = typeof cl === "object" ? Array.prototype.join.call(cl, " ") : cl;
-      const match = clStr.match(/\boption-(\d+)\b/);
-      if (match) {
-        const classIndex = parseInt(match[1], 10) - 1;
-        if (correctAnswerIndices.indexOf(classIndex) !== -1) {
-          isCorrect = true;
-        }
-      }
-    }
+    // Set processing lock immediately to prevent double-trigger
+    isProcessing = true;
 
-    if (isCorrect) {
-      highlightCorrectElement(elem);
-      correctCount++;
-      if (!firstCorrectElement) firstCorrectElement = elem;
-    } else {
-      changeElementOpacity(elem);
-    }
-  });
+    const queryText = foundQuestion.structure.query ? stripHtml(foundQuestion.structure.query.text || "") : "";
+    log(`New question: "${queryText.substring(0, 60)}" [${foundQuestion.type}]`);
 
-  // Auto-click the first correct answer for MCQ
-  if (firstCorrectElement && correctAnswerIndices.length === 1) {
-    autoClickAnswer(firstCorrectElement);
+    // Try highlighting with retry (handles first-question timing issue)
+    tryHighlightWithRetry(foundQuestion, currentId).then(() => {
+      isProcessing = false;
+    });
+
+  } catch (err: any) {
+    isProcessing = false;
+    if (err.message && !err.message.includes("Could not retrieve") && !err.message.includes("Could not find")) {
+      log(`Error: ${err.message}`, "warn");
+    }
   }
-
-  log(`Highlighted ${correctCount} correct answer(s) out of ${optionElements.length} options`);
-
-  // Update panel with current question info
-  updatePanelQuestion(question, correctCount);
 };
 
 // ═══════════════════════════════════════════════════════
@@ -526,21 +710,17 @@ const createPanel = () => {
   document.body.appendChild(panel);
   panelElement = panel;
 
-  // Make panel draggable
   makeDraggable(panel, panel.querySelector("#way-danz-header")! as HTMLElement);
 
-  // Minimize button
   panel.querySelector("#way-danz-minimize")!.addEventListener("click", () => {
     panel.classList.toggle("minimized");
   });
 
-  // Auto-answer toggle
   panel.querySelector("#way-danz-auto-answer")!.addEventListener("change", (e: Event) => {
     CONFIG.autoAnswer = (e.target as HTMLInputElement).checked;
     log(`Auto-answer: ${CONFIG.autoAnswer ? "ON" : "OFF"}`);
   });
 
-  // Debug toggle
   panel.querySelector("#way-danz-debug")!.addEventListener("change", (e: Event) => {
     CONFIG.debugMode = (e.target as HTMLInputElement).checked;
     log(`Debug mode: ${CONFIG.debugMode ? "ON" : "OFF"}`);
@@ -624,72 +804,6 @@ const showAnswerInPanel = (question: QuizQuestion) => {
 };
 
 // ═══════════════════════════════════════════════════════
-//  MUTATION OBSERVER (Hybrid with Polling)
-// ═══════════════════════════════════════════════════════
-
-const setupMutationObserver = () => {
-  if (observer) observer.disconnect();
-
-  let debounceTimer: ReturnType<typeof setTimeout> | null = null;
-
-  observer = new MutationObserver(() => {
-    if (debounceTimer) clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => {
-      checkQuestionChange();
-    }, CONFIG.mutationDebounce);
-  });
-
-  observer.observe(document.body, {
-    childList: true,
-    subtree: true,
-    attributes: true,
-    attributeFilter: ["class", "data-testid", "role"],
-  });
-};
-
-// ═══════════════════════════════════════════════════════
-//  CORE LOGIC
-// ═══════════════════════════════════════════════════════
-
-const checkQuestionChange = () => {
-  if (!cachedQuiz) return;
-
-  try {
-    const currentId = getCurrentQuestionId();
-    if (!currentId || currentId === lastQuestionID) return;
-
-    // Search in cached quiz data
-    for (const q of cachedQuiz.data.questions) {
-      if (currentId === q._id) {
-        const queryText = q.structure.query ? stripHtml(q.structure.query.text || "") : "";
-        log(`New question: "${queryText.substring(0, 60)}" [${q.type}]`);
-        highlightAnswers(q);
-        lastQuestionID = currentId;
-        break;
-      }
-    }
-
-    // Also check Pinia store question list (more up-to-date in some game modes)
-    const storeQuestions = getQuestionList();
-    if (storeQuestions.length > 0) {
-      for (const q of storeQuestions) {
-        if (currentId === q._id && currentId !== lastQuestionID) {
-          const queryText = q.structure && q.structure.query ? stripHtml(q.structure.query.text || "") : "";
-          log(`New question (from store): "${queryText.substring(0, 60)}" [${q.type}]`);
-          highlightAnswers(q);
-          lastQuestionID = currentId;
-          break;
-        }
-      }
-    }
-  } catch (err: any) {
-    if (err.message && !err.message.includes("Could not retrieve") && !err.message.includes("Could not find")) {
-      log(`Error: ${err.message}`, "warn");
-    }
-  }
-};
-
-// ═══════════════════════════════════════════════════════
 //  LOGGING
 // ═══════════════════════════════════════════════════════
 
@@ -719,7 +833,7 @@ const startCheat = async () => {
   ╦ ╦╔═╗╔╗ ╔═╗╦ ╦╔═╗
   ║║║║╣ ╠╩╗╚═╗╠═╣║╣
   ╚╩╝╚═╝╚═╝╚═╝╩ ╩╚═╝
-  Wayground Cheat Engine v3.0
+  Wayground Cheat Engine v3.1
   https://github.com/Danz-Pro/Way-Danz
   `;
   console.log(banner, "color: #00E676; font-weight: bold; font-size: 12px;");
@@ -730,7 +844,7 @@ const startCheat = async () => {
   try {
     // Wait for game to be ready
     let attempts = 0;
-    const maxWait = 30; // 30 seconds max wait
+    const maxWait = 30;
 
     while (!isInGame() && attempts < maxWait) {
       updatePanelStatus(`Waiting for game... (${attempts + 1}s)`);
@@ -752,15 +866,17 @@ const startCheat = async () => {
     updatePanelStatus(`Active - ${cachedQuiz.data.questions.length} questions loaded`, true);
     log(`Script loaded! ${cachedQuiz.data.questions.length} questions ready.`);
 
-    // Setup hybrid detection: MutationObserver + interval polling
+    // Setup hybrid detection
     setupMutationObserver();
 
     pollTimer = setInterval(() => {
       checkQuestionChange();
     }, CONFIG.pollInterval);
 
-    // Initial check
-    checkQuestionChange();
+    // Initial check with a delay to let the first question's DOM render
+    setTimeout(() => {
+      checkQuestionChange();
+    }, 500);
 
   } catch (err: any) {
     updatePanelStatus(`Error: ${err.message}`, false);
@@ -784,8 +900,11 @@ const stopCheat = () => {
     panelElement = null;
   }
   isRunning = false;
+  isProcessing = false;
+  observerIsPaused = false;
   cachedQuiz = null;
   lastQuestionID = undefined;
+  lastHighlightedElements = [];
   log("Stopped");
 };
 

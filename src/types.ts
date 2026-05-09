@@ -50,4 +50,6 @@ export interface CheatConfig {
   retryAttempts: number;
   retryDelay: number;
   mutationDebounce: number;
+  firstQuestionRetryDelay: number;
+  firstQuestionMaxRetries: number;
 }
