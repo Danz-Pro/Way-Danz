@@ -13,10 +13,22 @@ export interface Vue2Element extends HTMLElement {
   __vue__: any;
 }
 
+interface QuizQuestionOptionMedia {
+  type: string;
+  url: string;
+  meta?: {
+    width: number;
+    height: number;
+    layout: string;
+  };
+}
+
 interface QuizQuestionOption {
   text: string;
   answer?: number;
   type?: string;
+  media?: QuizQuestionOptionMedia[];
+  matcher?: string;
 }
 
 export interface QuizQuestion {

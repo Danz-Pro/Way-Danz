@@ -189,21 +189,8 @@ const getOptionElements = (): HTMLElement[] => {
   throw new Error("Unable to find question option elements");
 };
 
-/**
- * Check if the current question has option elements rendered in the DOM.
- * Returns true if options exist (MCQ/MSQ), false if not (BLANK/OPEN/typing).
- */
-const hasOptionElements = (): boolean => {
-  try {
-    const opts = getOptionElements();
-    return opts.length >= 2;
-  } catch {
-    return false;
-  }
-};
-
 // ═══════════════════════════════════════════════════════
-//  TEXT UTILITIES
+//  TEXT & IMAGE UTILITIES
 // ═══════════════════════════════════════════════════════
 
 const stripHtml = (html: string): string => {
@@ -216,7 +203,8 @@ const stripHtml = (html: string): string => {
  * Normalize text for comparison:
  * - lowercase
  * - collapse whitespace
- * - strip numbers at the end (wayground adds "1", "2", "3" after option text)
+ * - strip wayground's trailing option numbers (e.g., "mouse2" → "mouse")
+ * - remove punctuation for matching
  * - trim
  */
 const normalizeText = (text: string): string => {
@@ -228,8 +216,133 @@ const normalizeText = (text: string): string => {
     .trim();
 };
 
+/**
+ * Extract the background-image URL from a DOM element.
+ * Wayground renders image options as CSS background-image on nested divs.
+ * Returns the base URL (without ?w=400&h=400 query params) for matching.
+ */
+const extractImageUrl = (elem: HTMLElement): string | null => {
+  // Search all descendant divs for background-image
+  const divs = elem.querySelectorAll<HTMLElement>("div");
+  for (let i = 0; i < divs.length; i++) {
+    const bg = divs[i].style.backgroundImage;
+    if (bg && bg.indexOf("quizizz") !== -1) {
+      // Extract URL from url("...") format
+      const match = bg.match(/url\(["']?([^"')]+)["']?\)/);
+      if (match) {
+        // Remove query params (?w=400&h=400) for matching
+        return match[1].split("?")[0];
+      }
+    }
+  }
+  return null;
+};
+
 // ═══════════════════════════════════════════════════════
-//  ANSWER HIGHLIGHTING (v3.2 — TEXT-ONLY matching)
+//  ANSWER DATA BUILDER (v3.3 — Image URL + BLANK support)
+// ═══════════════════════════════════════════════════════
+
+interface AnswerData {
+  /** Normalized text of correct answers (for text-based matching) */
+  texts: string[];
+  /** Whether any correct option is image-based (no text) */
+  hasImageOptions: boolean;
+  /** API indices of correct answers */
+  correctIndices: number[];
+  /** Image URLs of correct options (for image-based matching) */
+  correctImageUrls: string[];
+  /** For BLANK/OPEN: the answer text from options */
+  blankAnswerTexts: string[];
+}
+
+/**
+ * Build answer data from the API question structure.
+ *
+ * KEY INSIGHT: Wayground SHUFFLES option order in the DOM, so we can NEVER
+ * rely on index-based matching. We must match by:
+ *   1. Text content (for text-based options) — most reliable
+ *   2. Image URL (for image-based options) — compare media[].url with DOM background-image
+ *
+ * BLANK questions have answer=[] or [-1], but the actual answer text is
+ * in options[].text with a matcher field (e.g., "exact", "contains").
+ */
+const buildAnswerData = (question: QuizQuestion): AnswerData => {
+  const answer = question.structure.answer;
+  const options = question.structure.options;
+  const result: AnswerData = {
+    texts: [],
+    hasImageOptions: false,
+    correctIndices: [],
+    correctImageUrls: [],
+    blankAnswerTexts: [],
+  };
+
+  if (!options || options.length === 0) return result;
+
+  // ---- BLANK / OPEN questions ----
+  // These have answer=[] or answer=[-1], with the actual answer text in options
+  if (question.type === "BLANK" || question.type === "OPEN") {
+    options.forEach((opt) => {
+      const rawText = stripHtml(opt.text);
+      if (rawText.length > 0) {
+        result.blankAnswerTexts.push(rawText);
+      }
+    });
+    return result;
+  }
+
+  // ---- MCQ / MSQ questions ----
+  // Collect indices of correct answers
+  if (Array.isArray(answer)) {
+    answer.forEach((idx) => {
+      if (typeof idx === "number" && idx >= 0) result.correctIndices.push(idx);
+    });
+  } else if (typeof answer === "number" && answer >= 0) {
+    result.correctIndices.push(answer);
+  }
+
+  // Build correct answer texts and image URLs
+  result.correctIndices.forEach((idx) => {
+    if (idx < options.length) {
+      const opt = options[idx];
+      const rawText = stripHtml(opt.text);
+      const txt = normalizeText(rawText);
+
+      if (txt.length > 0) {
+        result.texts.push(txt);
+      } else {
+        // Empty text = image-based option
+        result.hasImageOptions = true;
+      }
+
+      // Extract image URL for image-based matching
+      if (opt.media && opt.media.length > 0 && opt.media[0].url) {
+        const url = opt.media[0].url.split("?")[0]; // Remove query params
+        result.correctImageUrls.push(url);
+      }
+    }
+  });
+
+  // If ALL correct answers have empty text but have image URLs, mark as image-based
+  if (result.texts.length === 0 && result.correctIndices.length > 0) {
+    result.hasImageOptions = true;
+  }
+
+  // Also check if ANY option is image-type (even if text exists for some)
+  if (!result.hasImageOptions) {
+    const hasAnyImageOption = options.some(
+      (opt) => opt.type === "image" || (opt.media && opt.media.length > 0 && stripHtml(opt.text).length === 0)
+    );
+    if (hasAnyImageOption && result.correctImageUrls.length > 0) {
+      result.hasImageOptions = true;
+    }
+  }
+
+  return result;
+};
+
+// ═══════════════════════════════════════════════════════
+//  ANSWER HIGHLIGHTING (v3.3 — Image URL + Text matching)
 // ═══════════════════════════════════════════════════════
 
 const clearPreviousHighlights = () => {
@@ -284,58 +397,10 @@ const autoClickAnswer = (elem: HTMLElement) => {
 };
 
 /**
- * Build a set of correct answer texts from the API question data.
- * CRITICAL: Wayground SHUFFLES option order in the DOM, so we MUST
- * match by text content only, NEVER by index.
- *
- * For image-based options (where text is empty), we can't do text matching.
- * We return empty array and handle those via index-based fallback in highlightAnswers.
- */
-const buildCorrectAnswerTexts = (question: QuizQuestion): { texts: string[]; hasImageOptions: boolean; correctIndices: number[] } => {
-  const answer = question.structure.answer;
-  const options = question.structure.options;
-  if (!options || options.length === 0) return { texts: [], hasImageOptions: false, correctIndices: [] };
-
-  // Collect indices of correct answers
-  const correctIndices: number[] = [];
-  if (Array.isArray(answer)) {
-    answer.forEach((idx) => {
-      if (typeof idx === "number" && idx >= 0) correctIndices.push(idx);
-    });
-  } else if (typeof answer === "number" && answer >= 0) {
-    correctIndices.push(answer);
-  }
-
-  // Check if any options are image-based (empty text after stripping HTML)
-  let hasImageOptions = false;
-  const correctTexts: string[] = [];
-
-  correctIndices.forEach((idx) => {
-    if (idx < options.length) {
-      const rawText = stripHtml(options[idx].text);
-      const txt = normalizeText(rawText);
-      if (txt.length > 0) {
-        correctTexts.push(txt);
-      } else {
-        // Empty text means this is likely an image-based option
-        hasImageOptions = true;
-      }
-    }
-  });
-
-  // If ALL correct answers have empty text, it's definitely image-based
-  if (correctTexts.length === 0 && correctIndices.length > 0) {
-    hasImageOptions = true;
-  }
-
-  return { texts: correctTexts, hasImageOptions, correctIndices };
-};
-
-/**
  * Check if a DOM element's text matches any correct answer text.
  * Uses EXACT match first, then fallback substring matching.
  */
-const isElementCorrect = (elem: HTMLElement, correctTexts: string[]): boolean => {
+const isElementCorrectByText = (elem: HTMLElement, correctTexts: string[]): boolean => {
   const elemText = normalizeText(stripHtml(elem.textContent || ""));
   if (elemText.length === 0) return false;
 
@@ -359,22 +424,48 @@ const isElementCorrect = (elem: HTMLElement, correctTexts: string[]): boolean =>
 };
 
 /**
+ * Check if a DOM element's background-image URL matches any correct answer image URL.
+ * Compares the base URL (without query params) for a match.
+ */
+const isElementCorrectByImage = (elem: HTMLElement, correctImageUrls: string[]): boolean => {
+  const elemImageUrl = extractImageUrl(elem);
+  if (!elemImageUrl) return false;
+
+  for (const correctUrl of correctImageUrls) {
+    if (correctUrl.length === 0) continue;
+    // Compare base URLs (already stripped of query params)
+    if (elemImageUrl === correctUrl) return true;
+    // Also check if one contains the other (for URL format differences)
+    if (elemImageUrl.indexOf(correctUrl) !== -1 || correctUrl.indexOf(elemImageUrl) !== -1) return true;
+  }
+
+  return false;
+};
+
+/**
  * Core highlight function.
- * Uses TEXT-BASED matching as primary strategy (Wayground shuffles options).
- * Falls back to INDEX-BASED matching for image-based options (where text is empty).
  *
- * For image-based options, Wayground renders them as numbered buttons (1, 2, 3...)
- * in the same order as the API. So DOM index N corresponds to API option N.
+ * Matching strategy (in priority order):
+ *   1. TEXT-BASED matching — compare normalized text content of DOM options with API answer texts
+ *   2. IMAGE URL matching — compare background-image URLs in DOM with media[].url from API
+ *   3. Never use index-based matching — Wayground SHUFFLES option order!
  */
 const highlightAnswers = (question: QuizQuestion): boolean => {
   pauseObserver();
   try {
     clearPreviousHighlights();
 
-    // Determine if this question type has selectable options
-    const hasOptions = question.structure.options && question.structure.options.length >= 2;
+    // Build answer data
+    const answerData = buildAnswerData(question);
 
-    // For question types without selectable options, just show answer in panel
+    // For BLANK/OPEN questions, just show answer in panel (no DOM options to highlight)
+    if (question.type === "BLANK" || question.type === "OPEN") {
+      showAnswerInPanel(question);
+      return true;
+    }
+
+    // Determine if this question type has selectable options in the DOM
+    const hasOptions = question.structure.options && question.structure.options.length >= 2;
     if (!hasOptions) {
       showAnswerInPanel(question);
       return true;
@@ -390,15 +481,14 @@ const highlightAnswers = (question: QuizQuestion): boolean => {
       return false;
     }
 
-    // Build correct answer data
-    const answerData = buildCorrectAnswerTexts(question);
     const correctTexts = answerData.texts;
     const isImageBased = answerData.hasImageOptions;
-    const correctIndices = answerData.correctIndices;
+    const correctImageUrls = answerData.correctImageUrls;
 
-    if (isImageBased) {
-      log(`Image-based options detected. Using index-based fallback. Correct indices: [${correctIndices.join(", ")}]`);
-    } else {
+    if (isImageBased && correctImageUrls.length > 0) {
+      log(`Image-based options. Matching by image URL. Correct URLs: ${correctImageUrls.length}`);
+    }
+    if (correctTexts.length > 0) {
       log(`Correct answer texts: [${correctTexts.join(", ")}]`);
     }
 
@@ -406,19 +496,18 @@ const highlightAnswers = (question: QuizQuestion): boolean => {
     let firstCorrectElement: HTMLElement | null = null;
     const styledElements: HTMLElement[] = [];
 
-    optionElements.forEach((elem, domIndex) => {
+    optionElements.forEach((elem) => {
       let elemIsCorrect = false;
 
-      if (isImageBased) {
-        // INDEX-BASED FALLBACK for image options:
-        // The DOM renders options in API order as numbered buttons (1, 2, 3)
-        // So DOM index matches API index directly
-        if (correctIndices.indexOf(domIndex) !== -1) {
-          elemIsCorrect = true;
-        }
-      } else {
-        // TEXT-BASED matching (primary, for text options)
-        elemIsCorrect = isElementCorrect(elem, correctTexts);
+      // Strategy 1: Text-based matching (works for text options)
+      if (!elemIsCorrect && correctTexts.length > 0) {
+        elemIsCorrect = isElementCorrectByText(elem, correctTexts);
+      }
+
+      // Strategy 2: Image URL matching (works for image options)
+      // CRITICAL: This replaces the old broken index-based matching
+      if (!elemIsCorrect && isImageBased && correctImageUrls.length > 0) {
+        elemIsCorrect = isElementCorrectByImage(elem, correctImageUrls);
       }
 
       if (elemIsCorrect) {
@@ -434,7 +523,7 @@ const highlightAnswers = (question: QuizQuestion): boolean => {
     lastHighlightedElements = styledElements;
 
     // Auto-click for MCQ (single correct answer)
-    if (firstCorrectElement && correctIndices.length === 1) {
+    if (firstCorrectElement && answerData.correctIndices.length === 1) {
       autoClickAnswer(firstCorrectElement);
     }
 
@@ -785,11 +874,11 @@ const updatePanelQuestion = (question: QuizQuestion, correctCount: number) => {
 
   const answerEl = panelElement.querySelector("#way-danz-answer-display");
   if (answerEl) {
-    const answerData = buildCorrectAnswerTexts(question);
+    const answerData = buildAnswerData(question);
     if (answerData.texts.length > 0) {
       answerEl.textContent = answerData.texts.join(" | ");
-    } else if (answerData.hasImageOptions) {
-      answerEl.textContent = `Option ${answerData.correctIndices.map(i => i + 1).join(" | ")} (image)`;
+    } else if (answerData.hasImageOptions && answerData.correctImageUrls.length > 0) {
+      answerEl.textContent = `Image option ${answerData.correctIndices.map(i => i + 1).join(", ")}`;
     } else {
       answerEl.textContent = "—";
     }
@@ -800,13 +889,20 @@ const showAnswerInPanel = (question: QuizQuestion) => {
   if (!panelElement) return;
   const answerEl = panelElement.querySelector("#way-danz-answer-display");
   if (answerEl) {
-    const answerData = buildCorrectAnswerTexts(question);
+    const answerData = buildAnswerData(question);
+
+    // BLANK/OPEN questions: show the answer text from options
+    if (answerData.blankAnswerTexts.length > 0) {
+      answerEl.textContent = `[${question.type}] ${answerData.blankAnswerTexts.join(" / ")}`;
+      return;
+    }
+
     if (answerData.texts.length > 0) {
       answerEl.textContent = `[${question.type}] ${answerData.texts.join(" | ")}`;
-    } else if (answerData.hasImageOptions) {
-      answerEl.textContent = `[${question.type}] Option ${answerData.correctIndices.map(i => i + 1).join(" | ")} (image)`;
+    } else if (answerData.hasImageOptions && answerData.correctImageUrls.length > 0) {
+      answerEl.textContent = `[${question.type}] Image option ${answerData.correctIndices.map(i => i + 1).join(", ")}`;
     } else {
-      answerEl.textContent = `[${question.type}] Type the answer`;
+      answerEl.textContent = `[${question.type}] —`;
     }
   }
 };
@@ -841,7 +937,7 @@ const startCheat = async () => {
   ╦ ╦╔═╗╔╗ ╔═╗╦ ╦╔═╗
   ║║║║╣ ╠╩╗╚═╗╠═╣║╣
   ╚╩╝╚═╝╚═╝╚═╝╩ ╩╚═╝
-  Wayground Cheat Engine v3.2
+  Wayground Cheat Engine v3.3
   https://github.com/Danz-Pro/Way-Danz
   `;
   console.log(banner, "color: #00E676; font-weight: bold; font-size: 12px;");
