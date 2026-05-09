@@ -1,7 +1,17 @@
 /*
-Way-Danz
+Way-Danz v4.0
 Optimized Wayground Cheat Engine
 Based on quizizz-cheat by gbaranski, updated & enhanced for wayground.com
+
+KEY FIXES in v4.0:
+  - Use /api/main/quiz/{quizId} API (returns correct answers reliably)
+  - Fallback to /api/main/game/{roomHash} API
+  - Fallback to Pinia store extraction
+  - Fix BLANK question answer parsing (optionId→options[].id mapping)
+  - Fix normalizeText (don't strip meaningful trailing numbers)
+  - Better question detection via gameQuestions.list + currentId
+  - Improved text matching (fuzzy, number-aware, HTML-entity aware)
+  - Anti-race: processing lock with timeout
 
 This program is free software: you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -18,7 +28,7 @@ Original: https://github.com/gbaranski/quizizz-cheat
 Enhanced: https://github.com/Danz-Pro/Way-Danz
 */
 
-import { QuizQuestion, QuizInfo, CheatConfig } from "./types";
+import { QuizQuestion, QuizInfo, QuizApiResponse, BlankAnswerItem, CheatConfig } from "./types";
 
 // ═══════════════════════════════════════════════════════
 //  CONFIGURATION
@@ -35,67 +45,121 @@ const CONFIG: CheatConfig = {
   retryDelay: 1500,
   mutationDebounce: 250,
   firstQuestionRetryDelay: 500,
-  firstQuestionMaxRetries: 10,
+  firstQuestionMaxRetries: 12,
 };
 
 // ═══════════════════════════════════════════════════════
 //  STATE
 // ═══════════════════════════════════════════════════════
 
-let cachedQuiz: QuizInfo | null = null;
+let cachedQuestions: Map<string, QuizQuestion> = new Map();
 let lastQuestionID: string | undefined = undefined;
 let isRunning = false;
 let isProcessing = false;
+let processingTimeout: ReturnType<typeof setTimeout> | null = null;
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let observer: MutationObserver | null = null;
 let panelElement: HTMLElement | null = null;
 let lastHighlightedElements: HTMLElement[] = [];
 let observerIsPaused = false;
+let questionsLoaded = false;
+let statsCorrect = 0;
+let statsTotal = 0;
 
 // ═══════════════════════════════════════════════════════
 //  PINIA STORE ACCESS (Vue 3)
 // ═══════════════════════════════════════════════════════
 
-const getPiniaInstance = () => {
-  const root = document.querySelector("#root");
-  if (!root) throw new Error("Could not find #root element");
+const getPiniaInstance = (): any => {
+  const root = document.querySelector("#root") || document.querySelector("#app");
+  if (!root) return null;
   const vueApp = (root as any).__vue_app__;
-  if (!vueApp) throw new Error("Could not find Vue app instance");
+  if (!vueApp) return null;
   const pinia = vueApp.config.globalProperties.$pinia;
-  if (!pinia) throw new Error("Could not find Pinia store");
+  if (!pinia) return null;
   return pinia;
 };
 
-const getStoreState = (storeName: string) => {
+const getStoreState = (storeName: string): any => {
   const pinia = getPiniaInstance();
+  if (!pinia) return null;
   const store = pinia._s.get(storeName);
-  if (!store) throw new Error(`Could not find ${storeName} store`);
+  if (!store) return null;
   return store.$state;
 };
 
-const getRoomHash = (): string => {
-  const state = getStoreState("gameData");
-  const roomHash = state.roomHash;
-  if (!roomHash) throw new Error("Could not retrieve roomHash from gameData store");
-  return roomHash;
+const getStoreValue = (storeName: string, key: string): any => {
+  const state = getStoreState(storeName);
+  if (!state) return null;
+  return state[key] || null;
+};
+
+const getRoomHash = (): string | null => {
+  return getStoreValue("gameData", "roomHash");
+};
+
+const getQuizId = (): string | null => {
+  return getStoreValue("gameData", "quizId");
 };
 
 const getCurrentQuestionId = (): string | null => {
-  try {
-    const state = getStoreState("gameQuestions");
-    return state.currentId || state.currentQuestionId || state.cachedCurrentQuestionId || null;
-  } catch {
-    return null;
+  const state = getStoreState("gameQuestions");
+  if (!state) return null;
+
+  // Try multiple property names
+  const directId = state.currentId || state.currentQuestionId || state.cachedCurrentQuestionId;
+  if (directId) return directId;
+
+  // Try to get from gameFlow or other stores
+  const flowState = getStoreState("gameFlow");
+  if (flowState) {
+    const flowId = flowState.currentQuestionId || flowState.cachedCurrentQuestionId;
+    if (flowId) return flowId;
   }
+
+  return null;
 };
 
 const isInGame = (): boolean => {
   try {
     const state = getStoreState("gameData");
-    return !!(state.roomHash && state.gameState);
+    return !!(state && state.roomHash && state.gameState);
   } catch {
     return false;
   }
+};
+
+/**
+ * Extract questions directly from Pinia store as last resort.
+ * The gameQuestions.list is an object keyed by question ID.
+ * NOTE: Answer field may be -1 or [] before answering (anti-cheat),
+ * but we try anyway as a fallback.
+ */
+const extractQuestionsFromStore = (): QuizQuestion[] => {
+  const state = getStoreState("gameQuestions");
+  if (!state || !state.list) return [];
+
+  const questions: QuizQuestion[] = [];
+  const list = state.list;
+
+  if (typeof list === "object") {
+    for (const id of Object.keys(list)) {
+      const q = list[id];
+      if (q && q.type && q.structure) {
+        questions.push({
+          _id: id,
+          type: q.type,
+          structure: {
+            answer: q.structure.answer,
+            options: q.structure.options || [],
+            query: q.structure.query,
+          },
+        });
+      }
+    }
+  }
+
+  return questions;
 };
 
 // ═══════════════════════════════════════════════════════
@@ -109,7 +173,7 @@ const fetchWithRetry = async (url: string, retries: number = CONFIG.retryAttempt
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       return response;
     } catch (err: any) {
-      log(`Fetch attempt ${attempt}/${retries} failed: ${err.message}`, "warn");
+      log(`Fetch attempt ${attempt}/${retries} failed for ${url}: ${err.message}`, "warn");
       if (attempt < retries) {
         await new Promise((r) => setTimeout(r, CONFIG.retryDelay * attempt));
       } else {
@@ -120,13 +184,147 @@ const fetchWithRetry = async (url: string, retries: number = CONFIG.retryAttempt
   throw new Error("All retry attempts exhausted");
 };
 
-const fetchQuizData = async (): Promise<QuizInfo> => {
-  const roomHash = getRoomHash();
-  log(`Room hash: ${roomHash}`);
+/**
+ * PRIMARY: Fetch quiz data from /api/main/quiz/{quizId}
+ * This endpoint reliably returns correct answers for ALL question types.
+ */
+const fetchQuizDataFromQuizAPI = async (quizId: string): Promise<QuizQuestion[]> => {
+  log(`Fetching quiz data from quiz API: quizId=${quizId}`);
+
+  const response = await fetchWithRetry(`https://wayground.com/_api/main/quiz/${quizId}`);
+  const data: QuizApiResponse = await response.json();
+
+  if (!data.success || !data.data?.quiz?.info?.questions) {
+    throw new Error("Quiz API response missing question data");
+  }
+
+  const questions = data.data.quiz.info.questions;
+  log(`Quiz API: Loaded ${questions.length} questions with answers`);
+
+  // Debug: Log first question answer format
+  if (questions.length > 0) {
+    const q0 = questions[0];
+    log(`First question: type=${q0.type}, answer=${JSON.stringify(q0.structure.answer)}, options=${q0.structure.options?.length || 0}`);
+  }
+
+  return questions;
+};
+
+/**
+ * FALLBACK 1: Fetch quiz data from /api/main/game/{roomHash}
+ * This may or may not include correct answers depending on game state.
+ */
+const fetchQuizDataFromGameAPI = async (roomHash: string): Promise<QuizQuestion[]> => {
+  log(`Fetching quiz data from game API: roomHash=${roomHash}`);
+
   const response = await fetchWithRetry(`https://wayground.com/_api/main/game/${roomHash}`);
-  const quiz: QuizInfo = await response.json();
-  log(`Loaded ${quiz.data.questions.length} questions`);
-  return quiz;
+  const data: QuizInfo = await response.json();
+
+  if (!data.data?.questions) {
+    throw new Error("Game API response missing question data");
+  }
+
+  const questions = data.data.questions;
+  log(`Game API: Loaded ${questions.length} questions`);
+
+  return questions;
+};
+
+/**
+ * Main quiz data fetcher - tries multiple sources in priority order.
+ * Returns true if questions were successfully loaded.
+ */
+const fetchQuizData = async (): Promise<boolean> => {
+  const quizId = getQuizId();
+  const roomHash = getRoomHash();
+
+  let questions: QuizQuestion[] = [];
+
+  // Strategy 1: Quiz API (most reliable - always has correct answers)
+  if (quizId) {
+    try {
+      questions = await fetchQuizDataFromQuizAPI(quizId);
+      if (questions.length > 0) {
+        log(`Loaded ${questions.length} questions from Quiz API (PRIMARY)`);
+      }
+    } catch (err: any) {
+      log(`Quiz API failed: ${err.message}`, "warn");
+    }
+  } else {
+    log("No quizId available, skipping Quiz API", "warn");
+  }
+
+  // Strategy 2: Game API (may have answers)
+  if (questions.length === 0 && roomHash) {
+    try {
+      questions = await fetchQuizDataFromGameAPI(roomHash);
+      if (questions.length > 0) {
+        log(`Loaded ${questions.length} questions from Game API (FALLBACK 1)`);
+      }
+    } catch (err: any) {
+      log(`Game API failed: ${err.message}`, "warn");
+    }
+  }
+
+  // Strategy 3: Extract from Pinia store (last resort, may have answer=-1)
+  if (questions.length === 0) {
+    try {
+      questions = extractQuestionsFromStore();
+      if (questions.length > 0) {
+        log(`Loaded ${questions.length} questions from Pinia store (FALLBACK 2 - answers may be hidden)`);
+      }
+    } catch (err: any) {
+      log(`Pinia extraction failed: ${err.message}`, "warn");
+    }
+  }
+
+  if (questions.length === 0) {
+    log("All data sources failed!", "error");
+    return false;
+  }
+
+  // Store questions in map for fast lookup by ID
+  cachedQuestions.clear();
+  questions.forEach((q) => {
+    cachedQuestions.set(q._id, q);
+  });
+
+  // Verify that we have actual answer data (not -1 or empty)
+  let validAnswers = 0;
+  cachedQuestions.forEach((q) => {
+    const answerData = buildAnswerData(q);
+    if (answerData.texts.length > 0 || answerData.correctImageUrls.length > 0 || answerData.blankAnswerTexts.length > 0) {
+      validAnswers++;
+    }
+  });
+
+  log(`Answer data quality: ${validAnswers}/${questions.length} questions have extractable answers`);
+
+  if (validAnswers === 0 && quizId) {
+    // Answers all empty - try refetching quiz API once more with delay
+    log("No valid answers found, retrying Quiz API in 2s...", "warn");
+    await new Promise((r) => setTimeout(r, 2000));
+    try {
+      questions = await fetchQuizDataFromQuizAPI(quizId);
+      cachedQuestions.clear();
+      questions.forEach((q) => {
+        cachedQuestions.set(q._id, q);
+      });
+      validAnswers = 0;
+      cachedQuestions.forEach((q) => {
+        const answerData = buildAnswerData(q);
+        if (answerData.texts.length > 0 || answerData.correctImageUrls.length > 0 || answerData.blankAnswerTexts.length > 0) {
+          validAnswers++;
+        }
+      });
+      log(`Retry: ${validAnswers}/${questions.length} questions have answers`);
+    } catch (err: any) {
+      log(`Retry failed: ${err.message}`, "error");
+    }
+  }
+
+  questionsLoaded = true;
+  return true;
 };
 
 // ═══════════════════════════════════════════════════════
@@ -134,9 +332,10 @@ const fetchQuizData = async (): Promise<QuizInfo> => {
 // ═══════════════════════════════════════════════════════
 
 const getOptionElements = (): HTMLElement[] => {
-  // Strategy 1: [role="option"] elements
+  // Strategy 1: [role="option"] elements (most reliable on wayground)
   const roleOptions = Array.from(document.querySelectorAll<HTMLElement>("[role='option']"));
   if (roleOptions.length >= 2) {
+    // Filter to actual selectable options
     const filtered = roleOptions.filter((el) => {
       const cl = el.className || "";
       const clStr = typeof cl === "object" ? Array.prototype.join.call(cl, " ") : cl;
@@ -149,6 +348,7 @@ const getOptionElements = (): HTMLElement[] => {
       );
     });
     if (filtered.length >= 2) return filtered;
+    // If no filter match, use all role=option elements (they might all be valid)
     return roleOptions;
   }
 
@@ -194,6 +394,7 @@ const getOptionElements = (): HTMLElement[] => {
 // ═══════════════════════════════════════════════════════
 
 const stripHtml = (html: string): string => {
+  if (!html) return "";
   const tmp = document.createElement("div");
   tmp.innerHTML = html;
   return (tmp.textContent || tmp.innerText || "").trim();
@@ -203,11 +404,27 @@ const stripHtml = (html: string): string => {
  * Normalize text for comparison:
  * - lowercase
  * - collapse whitespace
- * - strip wayground's trailing option numbers (e.g., "mouse2" → "mouse")
  * - remove punctuation for matching
  * - trim
+ *
+ * NOTE: We do NOT strip trailing numbers anymore because they can be
+ * part of the actual answer content (e.g., "3D", "World War 2", "H2O").
+ * Wayground used to append option indices to text but that's handled
+ * by the matching algorithm instead.
  */
 const normalizeText = (text: string): string => {
+  return text
+    .toLowerCase()
+    .replace(/[\s\u00A0]+/g, " ")
+    .replace(/[^\w\s\u4e00-\u9fff]/g, "")
+    .trim();
+};
+
+/**
+ * More aggressive normalization that also strips trailing digits.
+ * Used only as a fallback when exact normalized match fails.
+ */
+const normalizeTextAggressive = (text: string): string => {
   return text
     .toLowerCase()
     .replace(/[\s\u00A0]+/g, " ")
@@ -219,18 +436,16 @@ const normalizeText = (text: string): string => {
 /**
  * Extract the background-image URL from a DOM element.
  * Wayground renders image options as CSS background-image on nested divs.
- * Returns the base URL (without ?w=400&h=400 query params) for matching.
+ * Returns the base URL (without query params) for matching.
  */
 const extractImageUrl = (elem: HTMLElement): string | null => {
-  // Search all descendant divs for background-image
-  const divs = elem.querySelectorAll<HTMLElement>("div");
-  for (let i = 0; i < divs.length; i++) {
-    const bg = divs[i].style.backgroundImage;
-    if (bg && bg.indexOf("quizizz") !== -1) {
-      // Extract URL from url("...") format
+  // Check element itself and all descendant divs
+  const elements = [elem, ...Array.from(elem.querySelectorAll<HTMLElement>("div"))];
+  for (const el of elements) {
+    const bg = el.style.backgroundImage || getComputedStyle(el).backgroundImage;
+    if (bg && (bg.indexOf("quizizz") !== -1 || bg.indexOf("wayground") !== -1 || bg.indexOf("cloudinary") !== -1)) {
       const match = bg.match(/url\(["']?([^"')]+)["']?\)/);
       if (match) {
-        // Remove query params (?w=400&h=400) for matching
         return match[1].split("?")[0];
       }
     }
@@ -239,12 +454,14 @@ const extractImageUrl = (elem: HTMLElement): string | null => {
 };
 
 // ═══════════════════════════════════════════════════════
-//  ANSWER DATA BUILDER (v3.3 — Image URL + BLANK support)
+//  ANSWER DATA BUILDER (v4.0 — Full BLANK/MSQ/Image support)
 // ═══════════════════════════════════════════════════════
 
 interface AnswerData {
   /** Normalized text of correct answers (for text-based matching) */
   texts: string[];
+  /** Raw (non-normalized) text of correct answers for display */
+  rawTexts: string[];
   /** Whether any correct option is image-based (no text) */
   hasImageOptions: boolean;
   /** API indices of correct answers */
@@ -258,36 +475,61 @@ interface AnswerData {
 /**
  * Build answer data from the API question structure.
  *
- * KEY INSIGHT: Wayground SHUFFLES option order in the DOM, so we can NEVER
- * rely on index-based matching. We must match by:
- *   1. Text content (for text-based options) — most reliable
- *   2. Image URL (for image-based options) — compare media[].url with DOM background-image
- *
- * BLANK questions have answer=[] or [-1], but the actual answer text is
- * in options[].text with a matcher field (e.g., "exact", "contains").
+ * Handles all question types:
+ *   MCQ: answer = number (0-based index into options)
+ *   MSQ: answer = number[] (indices of correct options)
+ *   BLANK: answer = [{targetId, optionId}] — map optionId to options[].id
+ *   OPEN: answer = [] or [{targetId, optionId}]
  */
 const buildAnswerData = (question: QuizQuestion): AnswerData => {
   const answer = question.structure.answer;
-  const options = question.structure.options;
+  const options = question.structure.options || [];
   const result: AnswerData = {
     texts: [],
+    rawTexts: [],
     hasImageOptions: false,
     correctIndices: [],
     correctImageUrls: [],
     blankAnswerTexts: [],
   };
 
-  if (!options || options.length === 0) return result;
+  if (!options || options.length === 0) {
+    // BLANK questions may have empty options from game API
+    // but quiz API should have them
+    return result;
+  }
 
   // ---- BLANK / OPEN questions ----
-  // These have answer=[] or answer=[-1], with the actual answer text in options
   if (question.type === "BLANK" || question.type === "OPEN") {
-    options.forEach((opt) => {
-      const rawText = stripHtml(opt.text);
-      if (rawText.length > 0) {
-        result.blankAnswerTexts.push(rawText);
-      }
-    });
+    // Quiz API format: answer = [{targetId: "...", optionId: ["..."]}]
+    if (Array.isArray(answer) && answer.length > 0 && typeof answer[0] === "object" && answer[0] !== null) {
+      // Build an option ID → text map
+      const optionMap = new Map<string, string>();
+      options.forEach((opt) => {
+        if (opt.id) {
+          optionMap.set(opt.id, stripHtml(opt.text));
+        }
+      });
+
+      (answer as BlankAnswerItem[]).forEach((ansItem) => {
+        if (ansItem.optionId && Array.isArray(ansItem.optionId)) {
+          ansItem.optionId.forEach((optId) => {
+            const text = optionMap.get(optId);
+            if (text && text.length > 0) {
+              result.blankAnswerTexts.push(text);
+            }
+          });
+        }
+      });
+    } else {
+      // Fallback: all options are answers for BLANK
+      options.forEach((opt) => {
+        const rawText = stripHtml(opt.text);
+        if (rawText.length > 0) {
+          result.blankAnswerTexts.push(rawText);
+        }
+      });
+    }
     return result;
   }
 
@@ -295,13 +537,17 @@ const buildAnswerData = (question: QuizQuestion): AnswerData => {
   // Collect indices of correct answers
   if (Array.isArray(answer)) {
     answer.forEach((idx) => {
-      if (typeof idx === "number" && idx >= 0) result.correctIndices.push(idx);
+      if (typeof idx === "number" && idx >= 0) {
+        result.correctIndices.push(idx);
+      }
     });
   } else if (typeof answer === "number" && answer >= 0) {
     result.correctIndices.push(answer);
   }
+  // Handle answer = -1 (server hiding answer) - no indices available
+  // Handle answer = [] (empty array for MSQ) - no indices available
 
-  // Build correct answer texts and image URLs
+  // Build correct answer texts and image URLs from indices
   result.correctIndices.forEach((idx) => {
     if (idx < options.length) {
       const opt = options[idx];
@@ -310,6 +556,7 @@ const buildAnswerData = (question: QuizQuestion): AnswerData => {
 
       if (txt.length > 0) {
         result.texts.push(txt);
+        result.rawTexts.push(rawText);
       } else {
         // Empty text = image-based option
         result.hasImageOptions = true;
@@ -317,23 +564,25 @@ const buildAnswerData = (question: QuizQuestion): AnswerData => {
 
       // Extract image URL for image-based matching
       if (opt.media && opt.media.length > 0 && opt.media[0].url) {
-        const url = opt.media[0].url.split("?")[0]; // Remove query params
+        const url = opt.media[0].url.split("?")[0];
         result.correctImageUrls.push(url);
       }
     }
   });
 
-  // If ALL correct answers have empty text but have image URLs, mark as image-based
+  // If ALL correct answers have empty text but we have indices, mark as image-based
   if (result.texts.length === 0 && result.correctIndices.length > 0) {
     result.hasImageOptions = true;
   }
 
-  // Also check if ANY option is image-type (even if text exists for some)
-  if (!result.hasImageOptions) {
-    const hasAnyImageOption = options.some(
-      (opt) => opt.type === "image" || (opt.media && opt.media.length > 0 && stripHtml(opt.text).length === 0)
-    );
-    if (hasAnyImageOption && result.correctImageUrls.length > 0) {
+  // Also check if ANY correct option is image-type
+  if (!result.hasImageOptions && result.correctIndices.length > 0) {
+    const hasAnyImageOption = result.correctIndices.some((idx) => {
+      if (idx >= options.length) return false;
+      const opt = options[idx];
+      return opt.type === "image" || (opt.media && opt.media.length > 0 && stripHtml(opt.text).length === 0);
+    });
+    if (hasAnyImageOption) {
       result.hasImageOptions = true;
     }
   }
@@ -342,7 +591,7 @@ const buildAnswerData = (question: QuizQuestion): AnswerData => {
 };
 
 // ═══════════════════════════════════════════════════════
-//  ANSWER HIGHLIGHTING (v3.3 — Image URL + Text matching)
+//  ANSWER HIGHLIGHTING (v4.0 — Robust multi-strategy matching)
 // ═══════════════════════════════════════════════════════
 
 const clearPreviousHighlights = () => {
@@ -360,7 +609,7 @@ const clearPreviousHighlights = () => {
   });
   lastHighlightedElements = [];
 
-  // Broad sweep
+  // Broad sweep for any leftover highlights
   document.querySelectorAll<HTMLElement>("[data-way-danz-correct], [data-way-danz-wrong]").forEach((el) => {
     el.style.outline = "";
     el.style.outlineOffset = "";
@@ -398,25 +647,49 @@ const autoClickAnswer = (elem: HTMLElement) => {
 
 /**
  * Check if a DOM element's text matches any correct answer text.
- * Uses EXACT match first, then fallback substring matching.
+ * Multi-level matching strategy:
+ *   1. Exact normalized match (after lowercase, whitespace collapse, punctuation strip)
+ *   2. Aggressive normalized match (also strips trailing numbers - for wayground index suffixes)
+ *   3. Substring containment (for cases where DOM has extra wrapper text)
+ *   4. Numeric content match (for number-only answers like "3.21")
  */
 const isElementCorrectByText = (elem: HTMLElement, correctTexts: string[]): boolean => {
-  const elemText = normalizeText(stripHtml(elem.textContent || ""));
+  const elemRawText = stripHtml(elem.textContent || "");
+  const elemText = normalizeText(elemRawText);
   if (elemText.length === 0) return false;
 
   for (const correctText of correctTexts) {
     if (correctText.length === 0) continue;
 
-    // Exact match (most reliable)
+    // Level 1: Exact normalized match
     if (elemText === correctText) return true;
   }
 
-  // Fallback: substring containment (for cases where DOM has extra text)
+  // Level 2: Aggressive normalization (strips trailing numbers)
+  const elemTextAggressive = normalizeTextAggressive(elemRawText);
   for (const correctText of correctTexts) {
-    if (correctText.length >= 3 && elemText.length >= 3) {
+    const correctTextAggressive = normalizeTextAggressive(
+      // Re-derive from original since correctText is already normalized
+      correctTexts.length > 0 ? correctText : ""
+    );
+    if (correctTextAggressive.length >= 2 && elemTextAggressive === correctTextAggressive) return true;
+  }
+
+  // Level 3: Substring containment
+  for (const correctText of correctTexts) {
+    if (correctText.length >= 2 && elemText.length >= 2) {
       if (elemText.indexOf(correctText) !== -1 || correctText.indexOf(elemText) !== -1) {
         return true;
       }
+    }
+  }
+
+  // Level 4: Numeric comparison (for math questions)
+  const elemNum = parseFloat(elemRawText.replace(/[^\d.\-]/g, ""));
+  for (const correctText of correctTexts) {
+    const correctNum = parseFloat(correctText.replace(/[^\d.\-]/g, ""));
+    if (!isNaN(elemNum) && !isNaN(correctNum) && Math.abs(elemNum - correctNum) < 0.001) {
+      return true;
     }
   }
 
@@ -425,7 +698,6 @@ const isElementCorrectByText = (elem: HTMLElement, correctTexts: string[]): bool
 
 /**
  * Check if a DOM element's background-image URL matches any correct answer image URL.
- * Compares the base URL (without query params) for a match.
  */
 const isElementCorrectByImage = (elem: HTMLElement, correctImageUrls: string[]): boolean => {
   const elemImageUrl = extractImageUrl(elem);
@@ -433,9 +705,8 @@ const isElementCorrectByImage = (elem: HTMLElement, correctImageUrls: string[]):
 
   for (const correctUrl of correctImageUrls) {
     if (correctUrl.length === 0) continue;
-    // Compare base URLs (already stripped of query params)
     if (elemImageUrl === correctUrl) return true;
-    // Also check if one contains the other (for URL format differences)
+    // Also check substring for URL format differences
     if (elemImageUrl.indexOf(correctUrl) !== -1 || correctUrl.indexOf(elemImageUrl) !== -1) return true;
   }
 
@@ -446,8 +717,8 @@ const isElementCorrectByImage = (elem: HTMLElement, correctImageUrls: string[]):
  * Core highlight function.
  *
  * Matching strategy (in priority order):
- *   1. TEXT-BASED matching — compare normalized text content of DOM options with API answer texts
- *   2. IMAGE URL matching — compare background-image URLs in DOM with media[].url from API
+ *   1. TEXT-BASED matching — compare normalized text of DOM options with API answer texts
+ *   2. IMAGE URL matching — compare background-image URLs with media[].url from API
  *   3. Never use index-based matching — Wayground SHUFFLES option order!
  */
 const highlightAnswers = (question: QuizQuestion): boolean => {
@@ -458,15 +729,16 @@ const highlightAnswers = (question: QuizQuestion): boolean => {
     // Build answer data
     const answerData = buildAnswerData(question);
 
-    // For BLANK/OPEN questions, just show answer in panel (no DOM options to highlight)
+    // For BLANK/OPEN questions, just show answer in panel (no selectable DOM options)
     if (question.type === "BLANK" || question.type === "OPEN") {
       showAnswerInPanel(question);
       return true;
     }
 
-    // Determine if this question type has selectable options in the DOM
-    const hasOptions = question.structure.options && question.structure.options.length >= 2;
-    if (!hasOptions) {
+    // Check if we have any answer data to highlight
+    const hasAnswerData = answerData.texts.length > 0 || answerData.correctImageUrls.length > 0;
+    if (!hasAnswerData) {
+      log(`No answer data available for this question (answer may be hidden by server)`, "warn");
       showAnswerInPanel(question);
       return true;
     }
@@ -485,12 +757,7 @@ const highlightAnswers = (question: QuizQuestion): boolean => {
     const isImageBased = answerData.hasImageOptions;
     const correctImageUrls = answerData.correctImageUrls;
 
-    if (isImageBased && correctImageUrls.length > 0) {
-      log(`Image-based options. Matching by image URL. Correct URLs: ${correctImageUrls.length}`);
-    }
-    if (correctTexts.length > 0) {
-      log(`Correct answer texts: [${correctTexts.join(", ")}]`);
-    }
+    log(`Highlighting: ${correctTexts.length} text answers, ${correctImageUrls.length} image answers, ${isImageBased ? "image-based" : "text-based"}`);
 
     let correctCount = 0;
     let firstCorrectElement: HTMLElement | null = null;
@@ -499,13 +766,12 @@ const highlightAnswers = (question: QuizQuestion): boolean => {
     optionElements.forEach((elem) => {
       let elemIsCorrect = false;
 
-      // Strategy 1: Text-based matching (works for text options)
+      // Strategy 1: Text-based matching
       if (!elemIsCorrect && correctTexts.length > 0) {
         elemIsCorrect = isElementCorrectByText(elem, correctTexts);
       }
 
-      // Strategy 2: Image URL matching (works for image options)
-      // CRITICAL: This replaces the old broken index-based matching
+      // Strategy 2: Image URL matching
       if (!elemIsCorrect && isImageBased && correctImageUrls.length > 0) {
         elemIsCorrect = isElementCorrectByImage(elem, correctImageUrls);
       }
@@ -527,8 +793,12 @@ const highlightAnswers = (question: QuizQuestion): boolean => {
       autoClickAnswer(firstCorrectElement);
     }
 
+    statsTotal++;
+    if (correctCount > 0) statsCorrect++;
+
     log(`Highlighted ${correctCount} correct answer(s) out of ${optionElements.length} options`);
     updatePanelQuestion(question, correctCount);
+    updateStats();
     return true;
   } finally {
     resumeObserver();
@@ -603,7 +873,6 @@ const setupMutationObserver = () => {
 
 /**
  * Check if a question type can have highlightable DOM options.
- * BLANK/OPEN types use a text input, not selectable options.
  */
 const isOptionQuestionType = (type: string): boolean => {
   return ["MCQ", "MSQ"].includes(type);
@@ -638,30 +907,38 @@ const tryHighlightWithRetry = async (question: QuizQuestion, questionId: string)
 };
 
 const checkQuestionChange = () => {
-  if (!cachedQuiz || isProcessing) return;
+  if (!questionsLoaded || isProcessing) return;
 
   try {
     const currentId = getCurrentQuestionId();
     if (!currentId || currentId === lastQuestionID) return;
 
     // Find the question in cached quiz data
-    let foundQuestion: QuizQuestion | null = null;
-    for (const q of cachedQuiz.data.questions) {
-      if (currentId === q._id) {
-        foundQuestion = q;
-        break;
-      }
+    const foundQuestion = cachedQuestions.get(currentId);
+    if (!foundQuestion) {
+      log(`Question ID ${currentId} not found in cache (${cachedQuestions.size} questions cached)`, "warn");
+      return;
     }
 
-    if (!foundQuestion) return;
-
     isProcessing = true;
+
+    // Safety timeout: auto-release processing lock after 10 seconds
+    processingTimeout = setTimeout(() => {
+      if (isProcessing) {
+        log("Processing lock timeout - releasing", "warn");
+        isProcessing = false;
+      }
+    }, 10000);
 
     const queryText = foundQuestion.structure.query ? stripHtml(foundQuestion.structure.query.text || "") : "";
     log(`New question: "${queryText.substring(0, 60)}" [${foundQuestion.type}]`);
 
     tryHighlightWithRetry(foundQuestion, currentId).then(() => {
       isProcessing = false;
+      if (processingTimeout) {
+        clearTimeout(processingTimeout);
+        processingTimeout = null;
+      }
     });
   } catch (err: any) {
     isProcessing = false;
@@ -682,7 +959,7 @@ const createPanel = () => {
   panel.id = "way-danz-panel";
   panel.innerHTML = `
     <div id="way-danz-header">
-      <span id="way-danz-title">Way-Danz</span>
+      <span id="way-danz-title">Way-Danz v4.0</span>
       <button id="way-danz-minimize" title="Minimize">_</button>
     </div>
     <div id="way-danz-body">
@@ -716,7 +993,7 @@ const createPanel = () => {
       background: rgba(18, 18, 24, 0.95);
       border: 1px solid rgba(0, 230, 118, 0.3);
       border-radius: 10px;
-      width: 260px;
+      width: 280px;
       box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5), 0 0 16px rgba(0, 230, 118, 0.1);
       backdrop-filter: blur(12px);
       user-select: none;
@@ -759,6 +1036,7 @@ const createPanel = () => {
       margin-bottom: 6px;
     }
     #way-danz-status.active { color: #00E676; }
+    #way-danz-status.error { color: #FF5252; }
     #way-danz-question-info {
       font-size: 11px;
       color: #ccc;
@@ -855,12 +1133,12 @@ const makeDraggable = (element: HTMLElement, handle: HTMLElement) => {
   });
 };
 
-const updatePanelStatus = (status: string, active: boolean = false) => {
+const updatePanelStatus = (status: string, active: boolean = false, error: boolean = false) => {
   if (!panelElement) return;
   const el = panelElement.querySelector("#way-danz-status");
   if (el) {
     el.textContent = status;
-    el.className = active ? "active" : "";
+    el.className = error ? "error" : (active ? "active" : "");
   }
 };
 
@@ -875,12 +1153,14 @@ const updatePanelQuestion = (question: QuizQuestion, correctCount: number) => {
   const answerEl = panelElement.querySelector("#way-danz-answer-display");
   if (answerEl) {
     const answerData = buildAnswerData(question);
-    if (answerData.texts.length > 0) {
-      answerEl.textContent = answerData.texts.join(" | ");
+    if (answerData.blankAnswerTexts.length > 0) {
+      answerEl.textContent = answerData.blankAnswerTexts.join(" / ");
+    } else if (answerData.texts.length > 0) {
+      answerEl.textContent = answerData.rawTexts.length > 0 ? answerData.rawTexts.join(" | ") : answerData.texts.join(" | ");
     } else if (answerData.hasImageOptions && answerData.correctImageUrls.length > 0) {
       answerEl.textContent = `Image option ${answerData.correctIndices.map(i => i + 1).join(", ")}`;
     } else {
-      answerEl.textContent = "—";
+      answerEl.textContent = "No answer data available";
     }
   }
 };
@@ -891,19 +1171,26 @@ const showAnswerInPanel = (question: QuizQuestion) => {
   if (answerEl) {
     const answerData = buildAnswerData(question);
 
-    // BLANK/OPEN questions: show the answer text from options
     if (answerData.blankAnswerTexts.length > 0) {
       answerEl.textContent = `[${question.type}] ${answerData.blankAnswerTexts.join(" / ")}`;
       return;
     }
 
     if (answerData.texts.length > 0) {
-      answerEl.textContent = `[${question.type}] ${answerData.texts.join(" | ")}`;
+      answerEl.textContent = `[${question.type}] ${answerData.rawTexts.length > 0 ? answerData.rawTexts.join(" | ") : answerData.texts.join(" | ")}`;
     } else if (answerData.hasImageOptions && answerData.correctImageUrls.length > 0) {
       answerEl.textContent = `[${question.type}] Image option ${answerData.correctIndices.map(i => i + 1).join(", ")}`;
     } else {
-      answerEl.textContent = `[${question.type}] —`;
+      answerEl.textContent = `[${question.type}] No answer data available`;
     }
+  }
+};
+
+const updateStats = () => {
+  if (!panelElement) return;
+  const el = panelElement.querySelector("#way-danz-stats");
+  if (el) {
+    el.textContent = `Questions answered: ${statsTotal} | Highlighted: ${statsCorrect}`;
   }
 };
 
@@ -912,7 +1199,7 @@ const showAnswerInPanel = (question: QuizQuestion) => {
 // ═══════════════════════════════════════════════════════
 
 const log = (message: string, level: "info" | "warn" | "error" = "info") => {
-  const prefix = "[Way-Danz]";
+  const prefix = "[Way-Danz v4.0]";
   if (level === "error") {
     console.error(`${prefix} ${message}`);
   } else if (level === "warn") {
@@ -937,7 +1224,7 @@ const startCheat = async () => {
   ╦ ╦╔═╗╔╗ ╔═╗╦ ╦╔═╗
   ║║║║╣ ╠╩╗╚═╗╠═╣║╣
   ╚╩╝╚═╝╚═╝╚═╝╩ ╩╚═╝
-  Wayground Cheat Engine v3.3
+  Wayground Cheat Engine v4.0
   https://github.com/Danz-Pro/Way-Danz
   `;
   console.log(banner, "color: #00E676; font-weight: bold; font-size: 12px;");
@@ -956,17 +1243,25 @@ const startCheat = async () => {
     }
 
     if (!isInGame()) {
-      updatePanelStatus("No active game found. Join a game first!", false);
+      updatePanelStatus("No active game found. Join a game first!", false, true);
       log("No active game found. Please join a game first.");
       isRunning = false;
       return;
     }
 
     updatePanelStatus("Fetching quiz data...", false);
-    cachedQuiz = await fetchQuizData();
+    const success = await fetchQuizData();
 
-    updatePanelStatus(`Active - ${cachedQuiz.data.questions.length} questions loaded`, true);
-    log(`Script loaded! ${cachedQuiz.data.questions.length} questions ready.`);
+    if (!success) {
+      updatePanelStatus("Failed to load quiz data!", false, true);
+      log("Failed to load quiz data from all sources", "error");
+      isRunning = false;
+      return;
+    }
+
+    const qCount = cachedQuestions.size;
+    updatePanelStatus(`Active - ${qCount} questions loaded`, true);
+    log(`Script loaded! ${qCount} questions ready.`);
 
     setupMutationObserver();
 
@@ -977,9 +1272,49 @@ const startCheat = async () => {
     // Initial check with delay for DOM to render
     setTimeout(() => {
       checkQuestionChange();
-    }, 500);
+    }, 800);
+
+    // Also re-check quiz data periodically in case it wasn't available initially
+    // (e.g., quizId might become available after game starts)
+    let refetchCount = 0;
+    const refetchInterval = setInterval(async () => {
+      refetchCount++;
+      if (refetchCount > 5) {
+        clearInterval(refetchInterval);
+        return;
+      }
+
+      // If we have very few valid answers, try refetching
+      let validAnswers = 0;
+      cachedQuestions.forEach((q) => {
+        const ad = buildAnswerData(q);
+        if (ad.texts.length > 0 || ad.correctImageUrls.length > 0 || ad.blankAnswerTexts.length > 0) {
+          validAnswers++;
+        }
+      });
+
+      if (validAnswers < cachedQuestions.size * 0.5) {
+        log(`Only ${validAnswers}/${cachedQuestions.size} answers valid, trying refetch...`, "warn");
+        try {
+          await fetchQuizData();
+          const newValid = Array.from(cachedQuestions.values()).filter(q => {
+            const ad = buildAnswerData(q);
+            return ad.texts.length > 0 || ad.correctImageUrls.length > 0 || ad.blankAnswerTexts.length > 0;
+          }).length;
+          log(`Refetch: ${newValid}/${cachedQuestions.size} answers now valid`);
+          if (newValid > validAnswers) {
+            updatePanelStatus(`Active - ${cachedQuestions.size} questions (${newValid} with answers)`, true);
+          }
+        } catch {
+          // Ignore refetch errors
+        }
+      } else {
+        clearInterval(refetchInterval);
+      }
+    }, 5000);
+
   } catch (err: any) {
-    updatePanelStatus(`Error: ${err.message}`, false);
+    updatePanelStatus(`Error: ${err.message}`, false, true);
     log(`Fatal error: ${err.message}`, "error");
     isRunning = false;
   }
@@ -994,6 +1329,10 @@ const stopCheat = () => {
     observer.disconnect();
     observer = null;
   }
+  if (processingTimeout) {
+    clearTimeout(processingTimeout);
+    processingTimeout = null;
+  }
   clearPreviousHighlights();
   if (panelElement) {
     panelElement.remove();
@@ -1002,9 +1341,12 @@ const stopCheat = () => {
   isRunning = false;
   isProcessing = false;
   observerIsPaused = false;
-  cachedQuiz = null;
+  cachedQuestions.clear();
+  questionsLoaded = false;
   lastQuestionID = undefined;
   lastHighlightedElements = [];
+  statsCorrect = 0;
+  statsTotal = 0;
   log("Stopped");
 };
 
@@ -1024,6 +1366,8 @@ const stopCheat = () => {
     CONFIG.highlightColor = color;
     log(`Highlight color: ${color}`);
   },
+  getCachedQuestions: () => cachedQuestions,
+  refetch: fetchQuizData,
 };
 
 // Auto-start

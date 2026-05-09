@@ -1,7 +1,7 @@
 {
   "name": "way-danz",
-  "version": "3.0.0",
-  "description": "Optimized Wayground Cheat Engine - Highlights correct answers on wayground.com",
+  "version": "4.0.0",
+  "description": "Optimized Wayground Cheat Engine v4.0 - Multi-API answer fetching, BLANK support, robust matching",
   "main": "src/index.ts",
   "private": true,
   "scripts": {

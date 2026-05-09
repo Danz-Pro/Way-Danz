@@ -24,6 +24,7 @@ interface QuizQuestionOptionMedia {
 }
 
 interface QuizQuestionOption {
+  id?: string;
   text: string;
   answer?: number;
   type?: string;
@@ -31,11 +32,17 @@ interface QuizQuestionOption {
   matcher?: string;
 }
 
+/** BLANK answer format from quiz API: [{targetId, optionId}] */
+export interface BlankAnswerItem {
+  targetId: string;
+  optionId: string[];
+}
+
 export interface QuizQuestion {
   _id: string;
   type: string;
   structure: {
-    answer: number | number[];
+    answer: number | number[] | BlankAnswerItem[];
     options?: QuizQuestionOption[];
     query?: {
       text: string;
@@ -49,6 +56,21 @@ export interface QuizQuestion {
 export interface QuizInfo {
   data: {
     questions: QuizQuestion[];
+  };
+}
+
+/** Quiz API response format: data.quiz.info.questions */
+export interface QuizApiResponse {
+  success: boolean;
+  data: {
+    quiz: {
+      _id: string;
+      info: {
+        name: string;
+        questions: QuizQuestion[];
+      };
+    };
+    draft?: any;
   };
 }
 

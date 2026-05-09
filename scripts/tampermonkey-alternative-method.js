@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Way-Danz
 // @namespace    https://github.com/Danz-Pro/Way-Danz
-// @version      3.0
-// @description  Optimized Wayground Cheat Engine - Auto-highlights correct answers on wayground.com
+// @version      4.0
+// @description  Optimized Wayground Cheat Engine v4.0 - Multi-API answer fetching, BLANK support, robust matching
 // @author       Danz-Pro
 // @match        https://wayground.com/*
 // @match        https://*.wayground.com/*
@@ -20,9 +20,9 @@
   const waitForVue = () => {
     return new Promise((resolve) => {
       const check = () => {
-        const root = document.querySelector('#root');
+        const root = document.querySelector('#root') || document.querySelector('#app');
         if (root && root.__vue_app__) {
-          console.log('[Way-Danz] Vue 3 app detected, loading cheat engine...');
+          console.log('[Way-Danz v4.0] Vue 3 app detected, loading cheat engine...');
           resolve(true);
         } else {
           setTimeout(check, 500);
@@ -40,7 +40,7 @@
       const code = await response.text();
       eval(code);
     } catch (err) {
-      console.error('[Way-Danz] Failed to load cheat engine:', err);
+      console.error('[Way-Danz v4.0] Failed to load cheat engine:', err);
     }
   };
 
